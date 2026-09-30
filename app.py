@@ -1,9 +1,9 @@
 """
 Order Reconciliation App
 Compares orders across:
-  1. TC Orders sheet        (required) - Order No, Invoice No, Seller SKU, Marketplace
-  2. Marketplace sheet      (required) - Order No
-  3. WMS sheet              (optional) - client_order_id  (matched against TC Invoice No)
+  1. TC Orders sheet        (required) - order_number, invoice_number, custom_sku, channel
+  2. Marketplace sheet      (required) - Lazada / Shopee / TikTok export
+  3. WMS sheet              (optional) - client_order_id  (matched against TC invoice_number)
 Output: Marketplace Name | Order No | Seller SKU | Comments
 """
 import io
@@ -15,22 +15,44 @@ import streamlit as st
 st.set_page_config(page_title="Order Checker", page_icon="📦", layout="wide")
 
 NONE_OPT = "-- Not available --"
+MARKETPLACES = ["Lazada", "Shopee", "TikTok"]
 
-# Column-name guesses used to pre-select dropdowns
-GUESS = {
-    "order": ["order no", "order_no", "order number", "order id", "order_id", "orderid", "order item id", "sub order no"],
-    "invoice": ["invoice no", "invoice_no", "invoice number", "invoice id", "invoice"],
-    "sku": ["seller sku", "seller_sku", "sku", "sku id", "sku code", "seller sku code"],
-    "marketplace": ["marketplace", "marketplace name", "channel", "channel name", "platform"],
-    "client_order": ["client_order_id", "client order id", "clientorderid", "client_order_no"],
+# ------------------------------------------------------------------------------
+# Auto-mapping presets. The first name found in the uploaded sheet is selected.
+# Add more column names here if your exports use different headers.
+# ------------------------------------------------------------------------------
+TC_PRESET = {
+    "order":   ["order_number", "order no", "order_no", "order id", "order_id"],
+    "invoice": ["invoice_number", "invoice no", "invoice_no", "invoice"],
+    "sku":     ["custom_sku", "seller sku", "seller_sku", "sku"],
+    "channel": ["channel", "marketplace", "platform"],
+}
+
+MP_PRESET = {
+    "Lazada": {
+        "order": ["orderNumber", "order number", "order_number", "order no"],
+        "sku":   ["sellerSku", "seller sku", "seller_sku"],
+    },
+    "Shopee": {
+        "order": ["Order ID", "order_sn", "order sn", "order_id", "order no"],
+        "sku":   ["SKU Reference No.", "Parent SKU Reference No.", "seller_sku", "seller sku", "sku"],
+    },
+    "TikTok": {
+        "order": ["Order ID", "order_id", "order id", "order no"],
+        "sku":   ["Seller SKU", "seller_sku", "seller sku", "sku"],
+    },
+}
+
+WMS_PRESET = {
+    "client_order": ["client_order_id", "client order id", "clientorderid"],
+    "sku":          ["sku", "sku_code", "seller_sku", "item_code"],
 }
 
 
 # ---------------------------------------------------------------- helpers
 def read_file(uploaded, key):
     """Read CSV / Excel. For Excel with several tabs, let the user pick one."""
-    name = uploaded.name.lower()
-    if name.endswith(".csv"):
+    if uploaded.name.lower().endswith(".csv"):
         return pd.read_csv(uploaded, dtype=str, keep_default_na=False)
     xls = pd.ExcelFile(uploaded)
     sheet = xls.sheet_names[0]
@@ -50,18 +72,16 @@ def normalize(series):
     )
 
 
-def guess_index(columns, kind, allow_none=False):
-    opts = ([NONE_OPT] if allow_none else []) + list(columns)
-    lowered = [str(c).strip().lower() for c in opts]
-    for g in GUESS[kind]:
-        if g in lowered:
-            return lowered.index(g)
-    return 0
-
-
-def pick(label, df, kind, key, allow_none=False):
+def pick(label, df, candidates, key, allow_none=False):
+    """Selectbox that auto-selects the first matching column from candidates."""
     opts = ([NONE_OPT] if allow_none else []) + list(df.columns)
-    return st.selectbox(label, opts, index=guess_index(df.columns, kind, allow_none), key=key)
+    lowered = [str(c).strip().lower() for c in opts]
+    idx = 0
+    for cand in candidates:
+        if cand.strip().lower() in lowered:
+            idx = lowered.index(cand.strip().lower())
+            break
+    return st.selectbox(label, opts, index=idx, key=key)
 
 
 def join_unique(values):
@@ -87,53 +107,63 @@ def to_excel(report, summary):
 
 # ---------------------------------------------------------------- UI
 st.title("📦 Order Checker – TC vs Marketplace vs WMS")
-st.caption("Upload the sheets, map the columns, and download the comparison report.")
+st.caption("Pick the marketplace, upload the sheets, confirm the columns and download the report.")
+
+marketplace = st.selectbox("🛒 Marketplace", MARKETPLACES, index=0)
 
 c1, c2, c3 = st.columns(3)
 with c1:
     st.subheader("1️⃣ TC Orders sheet")
     tc_file = st.file_uploader("Required", type=["xlsx", "xls", "csv"], key="tc")
 with c2:
-    st.subheader("2️⃣ Marketplace sheet")
+    st.subheader(f"2️⃣ {marketplace} sheet")
     mp_file = st.file_uploader("Required", type=["xlsx", "xls", "csv"], key="mp")
 with c3:
     st.subheader("3️⃣ WMS sheet")
     wms_file = st.file_uploader("Optional", type=["xlsx", "xls", "csv"], key="wms")
 
 if not (tc_file and mp_file):
-    st.info("Upload at least the TC Orders sheet and the Marketplace sheet to begin.")
+    st.info(f"Upload at least the TC Orders sheet and the {marketplace} sheet to begin.")
     st.stop()
 
 # ---------------------------------------------------------------- column mapping
 st.divider()
 st.subheader("🔧 Column mapping")
+st.caption("Columns are mapped automatically for the selected marketplace – change them only if needed.")
 m1, m2, m3 = st.columns(3)
+k = marketplace  # widget keys include marketplace so mapping refreshes when it changes
 
 with m1:
     st.markdown("**TC Orders**")
     tc = read_file(tc_file, "tc")
-    tc_order = pick("Order No", tc, "order", "tc_order")
-    tc_invoice = pick("Invoice No (used for WMS)", tc, "invoice", "tc_inv", allow_none=True)
-    tc_sku = pick("Seller SKU", tc, "sku", "tc_sku", allow_none=True)
-    tc_mp = pick("Marketplace Name", tc, "marketplace", "tc_mp", allow_none=True)
+    tc_order = pick("Order No", tc, TC_PRESET["order"], f"tc_order_{k}")
+    tc_invoice = pick("Invoice No (used for WMS)", tc, TC_PRESET["invoice"], f"tc_inv_{k}", allow_none=True)
+    tc_sku = pick("Seller SKU", tc, TC_PRESET["sku"], f"tc_sku_{k}", allow_none=True)
+    tc_channel = pick("Channel (to filter marketplace)", tc, TC_PRESET["channel"], f"tc_ch_{k}", allow_none=True)
+
+    # Keep only TC rows belonging to the selected marketplace
+    tc_channels_sel = None
+    if tc_channel != NONE_OPT:
+        all_ch = sorted(v for v in tc[tc_channel].astype(str).str.strip().unique() if v)
+        default_ch = [c for c in all_ch if marketplace.lower() in c.lower()]
+        tc_channels_sel = st.multiselect(
+            f"Channel values for {marketplace}", all_ch, default=default_ch, key=f"tc_chv_{k}"
+        )
 
 with m2:
-    st.markdown("**Marketplace**")
+    st.markdown(f"**{marketplace}**")
     mp = read_file(mp_file, "mp")
-    mp_order = pick("Order No", mp, "order", "mp_order")
-    mp_sku = pick("Seller SKU", mp, "sku", "mp_sku", allow_none=True)
-    mp_mp = pick("Marketplace Name", mp, "marketplace", "mp_mp", allow_none=True)
-    default_mp_name = st.text_input(
-        "Marketplace name (used when no column is available)", value="Marketplace"
-    )
+    mp_order = pick("Order No", mp, MP_PRESET[marketplace]["order"], f"mp_order_{k}")
+    mp_sku = pick("Seller SKU", mp, MP_PRESET[marketplace]["sku"], f"mp_sku_{k}", allow_none=True)
+    st.text_input("Marketplace Name", value=marketplace, disabled=True, key=f"mp_name_{k}")
 
 wms = None
 with m3:
     st.markdown("**WMS**")
     if wms_file:
         wms = read_file(wms_file, "wms")
-        wms_client = pick("client_order_id", wms, "client_order", "wms_client")
-        wms_sku = pick("SKU (optional)", wms, "sku", "wms_sku", allow_none=True)
+        wms_client = pick("client_order_id", wms, WMS_PRESET["client_order"], f"wms_client_{k}")
+        wms_sku = pick("SKU (optional)", wms, WMS_PRESET["sku"], f"wms_sku_{k}", allow_none=True)
         if tc_invoice == NONE_OPT:
             st.warning("Select the Invoice No column in TC Orders to compare with WMS.")
     else:
@@ -143,13 +173,18 @@ use_wms = wms is not None and tc_invoice != NONE_OPT
 
 # ---------------------------------------------------------------- comparison
 if st.button("▶️ Run order check", type="primary", use_container_width=True):
-    # --- build clean frames
+    tc_src = tc
+    if tc_channels_sel is not None:
+        if not tc_channels_sel:
+            st.error(f"Select at least one channel value for {marketplace} in the TC Orders mapping.")
+            st.stop()
+        tc_src = tc[tc[tc_channel].astype(str).str.strip().isin(tc_channels_sel)]
+
     tcd = pd.DataFrame({
-        "key": normalize(tc[tc_order]),
-        "order": tc[tc_order].astype(str).str.strip(),
-        "invoice": normalize(tc[tc_invoice]) if tc_invoice != NONE_OPT else "",
-        "sku": tc[tc_sku].astype(str).str.strip() if tc_sku != NONE_OPT else "",
-        "mp": tc[tc_mp].astype(str).str.strip() if tc_mp != NONE_OPT else "",
+        "key": normalize(tc_src[tc_order]),
+        "order": tc_src[tc_order].astype(str).str.strip(),
+        "invoice": normalize(tc_src[tc_invoice]) if tc_invoice != NONE_OPT else "",
+        "sku": tc_src[tc_sku].astype(str).str.strip() if tc_sku != NONE_OPT else "",
     })
     tcd = tcd[tcd["key"].ne("") & tcd["key"].ne("NAN")]
 
@@ -157,7 +192,6 @@ if st.button("▶️ Run order check", type="primary", use_container_width=True)
         "key": normalize(mp[mp_order]),
         "order": mp[mp_order].astype(str).str.strip(),
         "sku": mp[mp_sku].astype(str).str.strip() if mp_sku != NONE_OPT else "",
-        "mp": mp[mp_mp].astype(str).str.strip() if mp_mp != NONE_OPT else "",
     })
     mpd = mpd[mpd["key"].ne("") & mpd["key"].ne("NAN")]
 
@@ -172,14 +206,14 @@ if st.button("▶️ Run order check", type="primary", use_container_width=True)
         wmsd = wmsd[wmsd["key"].ne("") & wmsd["key"].ne("NAN")]
         wms_keys = set(wmsd["key"])
 
-    # --- group per order (one row per order, SKUs joined)
-    tc_g = tcd.groupby("key").agg(
-        order=("order", "first"), invoice=("invoice", join_unique),
-        sku=("sku", join_unique), mp=("mp", join_unique)).reset_index()
-    mp_g = mpd.groupby("key").agg(
-        order=("order", "first"), sku=("sku", join_unique), mp=("mp", join_unique)).reset_index()
-
+    # one row per order, multiple SKUs joined
+    tc_g = tcd.groupby("key").agg(order=("order", "first"), invoice=("invoice", join_unique),
+                                  sku=("sku", join_unique)).reset_index()
+    mp_g = mpd.groupby("key").agg(order=("order", "first"), sku=("sku", join_unique)).reset_index()
     merged = tc_g.merge(mp_g, on="key", how="outer", suffixes=("_tc", "_mp"))
+
+    def val(x):
+        return x if isinstance(x, str) and x else ""
 
     rows = []
     for _, r in merged.iterrows():
@@ -188,7 +222,7 @@ if st.button("▶️ Run order check", type="primary", use_container_width=True)
         if not in_tc:
             comments.append("Order not available in TC Orders sheet")
         if not in_mp:
-            comments.append("Order not available in Marketplace sheet")
+            comments.append(f"Order not available in {marketplace} sheet")
         if use_wms and in_tc:
             invoices = [i.strip() for i in str(r["invoice"]).split(",") if i.strip()]
             if not invoices:
@@ -196,21 +230,14 @@ if st.button("▶️ Run order check", type="primary", use_container_width=True)
             elif not any(i in wms_keys for i in invoices):
                 comments.append(f"Invoice No {', '.join(invoices)} not available in WMS sheet")
 
-        mp_name = (r.get("mp_tc") if isinstance(r.get("mp_tc"), str) and r.get("mp_tc") else None) \
-            or (r.get("mp_mp") if isinstance(r.get("mp_mp"), str) and r.get("mp_mp") else None) \
-            or default_mp_name
-        sku = (r.get("sku_tc") if isinstance(r.get("sku_tc"), str) and r.get("sku_tc") else None) \
-            or (r.get("sku_mp") if isinstance(r.get("sku_mp"), str) and r.get("sku_mp") else "")
-        order = r["order_tc"] if isinstance(r["order_tc"], str) else r["order_mp"]
-
         rows.append({
-            "Marketplace Name": mp_name,
-            "Order No": order,
-            "Seller SKU": sku,
+            "Marketplace Name": marketplace,
+            "Order No": val(r["order_tc"]) or val(r["order_mp"]),
+            "Seller SKU": val(r["sku_tc"]) or val(r["sku_mp"]),
             "Comments": "; ".join(comments) if comments else "Order available in all sheets",
         })
 
-    # --- WMS records whose client_order_id doesn't match any TC invoice
+    # WMS records whose client_order_id doesn't match any TC invoice
     if use_wms:
         tc_invoices = set()
         for inv in tc_g["invoice"]:
@@ -219,7 +246,7 @@ if st.button("▶️ Run order check", type="primary", use_container_width=True)
             raw=("raw", "first"), sku=("sku", join_unique)).reset_index()
         for _, r in extra.iterrows():
             rows.append({
-                "Marketplace Name": default_mp_name,
+                "Marketplace Name": marketplace,
                 "Order No": r["raw"],
                 "Seller SKU": r["sku"],
                 "Comments": f"client_order_id {r['raw']} available in WMS but not in TC Orders (Invoice No)",
@@ -227,47 +254,43 @@ if st.button("▶️ Run order check", type="primary", use_container_width=True)
 
     report = pd.DataFrame(rows, columns=["Marketplace Name", "Order No", "Seller SKU", "Comments"])
     ok_mask = report["Comments"] == "Order available in all sheets"
-
     summary = pd.DataFrame({
-        "Metric": [
-            "Orders in TC Orders sheet", "Orders in Marketplace sheet",
-            "Records in WMS sheet" if use_wms else "WMS check",
-            "Orders matched in all sheets", "Orders with issues",
-        ],
-        "Value": [
-            len(tc_keys), len(mp_keys),
-            len(wms_keys) if use_wms else "Skipped",
-            int(ok_mask.sum()), int((~ok_mask).sum()),
-        ],
+        "Metric": ["Marketplace", f"Orders in TC Orders sheet ({marketplace})",
+                   f"Orders in {marketplace} sheet",
+                   "Records in WMS sheet" if use_wms else "WMS check",
+                   "Orders matched in all sheets", "Orders with issues"],
+        "Value": [marketplace, len(tc_keys), len(mp_keys),
+                  len(wms_keys) if use_wms else "Skipped",
+                  int(ok_mask.sum()), int((~ok_mask).sum())],
     })
-    st.session_state["report"], st.session_state["summary"] = report, summary
+    st.session_state["result"] = (marketplace, report, summary)
 
 # ---------------------------------------------------------------- results
-if "report" in st.session_state:
-    report, summary = st.session_state["report"], st.session_state["summary"]
+if "result" in st.session_state and st.session_state["result"][0] == marketplace:
+    _, report, summary = st.session_state["result"]
     ok_mask = report["Comments"] == "Order available in all sheets"
 
     st.divider()
-    st.subheader("📊 Results")
-    k = st.columns(4)
-    k[0].metric("TC orders", summary.iloc[0, 1])
-    k[1].metric("Marketplace orders", summary.iloc[1, 1])
-    k[2].metric("✅ Matched", int(ok_mask.sum()))
-    k[3].metric("⚠️ Issues", int((~ok_mask).sum()))
+    st.subheader(f"📊 Results – {marketplace}")
+    kc = st.columns(4)
+    kc[0].metric("TC orders", summary.iloc[1, 1])
+    kc[1].metric(f"{marketplace} orders", summary.iloc[2, 1])
+    kc[2].metric("✅ Matched", int(ok_mask.sum()))
+    kc[3].metric("⚠️ Issues", int((~ok_mask).sum()))
 
     only_issues = st.toggle("Show only mismatches", value=True)
     search = st.text_input("🔍 Search order no / SKU")
     view = report[~ok_mask] if only_issues else report
     if search:
         s = search.strip().upper()
-        view = view[view["Order No"].str.upper().str.contains(s, na=False)
-                    | view["Seller SKU"].str.upper().str.contains(s, na=False)]
+        view = view[view["Order No"].str.upper().str.contains(s, na=False, regex=False)
+                    | view["Seller SKU"].str.upper().str.contains(s, na=False, regex=False)]
     st.dataframe(view, use_container_width=True, hide_index=True)
 
     st.download_button(
         "⬇️ Download output sheet (Excel)",
         data=to_excel(report, summary),
-        file_name=f"order_check_{datetime.now():%Y%m%d_%H%M}.xlsx",
+        file_name=f"order_check_{marketplace.lower()}_{datetime.now():%Y%m%d_%H%M}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
